@@ -1,0 +1,13 @@
+zero-indexer-hub Caution enclave ('zeronym-hub-7')
+source repo:     github.com/ShieldedLabs/zero
+serves:          zeronym-hub-7.shieldedinfra.net (TLS terminated in-enclave, ACME production)
+broadcasts via:  66.241.124.200:443 verified as na.zec.rocks
+mixnet:          OFF (clearnet HTTP submit only)
+app source:      https://github.com/ShieldedLabs/zero-hub
+source commit:   064e0f3dd209ce134380a7cc9ae34e724782a79f
+expected binary: e3a6aace9a43b9a14349b412efff08bc3b8bf0e4583aa2ee8f0daf6d641f6b04
+
+The binary inside this EIF should hash to the value above. Verify with:
+  git clone https://github.com/ShieldedLabs/zero && cd zero
+  git checkout 064e0f3dd209ce134380a7cc9ae34e724782a79f
+  sh zeronym/hub/deploy/reproduce.sh
