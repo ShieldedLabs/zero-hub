@@ -1,0 +1,199 @@
+# zero-indexer-hub as a standalone attested Nitro enclave on Caution.
+#
+# Sibling of zeronym/shim/deploy/caution/caution.hcl.tmpl. The shim's enclave
+# hides migration content FROM the operator; this one is where that content
+# lands. The hub receives the diverted transaction in plaintext and broadcasts
+# it to the Zcash network, so of the two enclaves this is the one that most
+# needs attestation: it is the single point that sees what the whole system
+# exists to hide.
+#
+# WHAT IT PROVES. The Zeronym trust model asks an auditor to rebuild the hub from
+# source, reach the published hash, and check that hash against the one bound
+# into the enclave attestation. Reproducibility alone proves only that source and
+# binary agree; attestation alone proves only that SOME binary runs in a genuine
+# enclave. Together they say: the code you read is the code that is holding your
+# migration in plaintext, and it does nothing with it but broadcast it. The
+# binary under audit is the one recorded in deploy/EXPECTED_SHA256, built from the
+# same commit this deploy repo was assembled from.
+
+enclave "zeronym-hub-9" {
+  build {
+    # Assembled by assemble-caution.sh, which copies it out of the
+    # `git archive HEAD` context rather than the working tree, so the recipe is
+    # pinned to the same commit as the sources it compiles. See the README.
+    containerfile = "Containerfile"
+
+    # Where this assembled repository is published. 'caution verify' clones
+    # this URL and rebuilds, so its root must be THIS directory, not the zero
+    # monorepo, and the deployed commit must be pushed there on main and
+    # tagged: the manifest pins branch AND commit.
+    app_sources = ["https://github.com/ShieldedLabs/zero-hub"]
+  }
+
+  resources {
+    # The hub holds a batching queue in RAM between flushes, and nothing else:
+    # no chain state, no database, no disk. The queue is bounded by an explicit
+    # byte budget (64 MiB, roughly a thousand 64 KiB frames), which is what
+    # bounds this enclave's memory against a submitter who simply keeps
+    # submitting. 2 GB leaves that budget an ample margin over EnclaveOS.
+    #
+    # The queue is deliberately NOT persisted. An enclave is diskless, so a
+    # restart drops whatever was held and the shims re-submit; persisting it
+    # would mean writing plaintext migrations somewhere the operator could read,
+    # which is the one thing this component exists to prevent.
+    #
+    # Four vCPUs, not two. Measured 2026-08-17 with the same hub binary in a
+    # container pinned to 2 vCPU: an idle lookup was as fast as unconstrained
+    # (2-5 s, ~7 % CPU), but a wallet-sync burst of 8 concurrent lookups was
+    # ~2.4x slower than unconstrained (batch 24 s vs 10 s, tail 19-23 s) at only
+    # 19 % of the two cores -- so not CPU-bound, but enough packet-processing
+    # latency to lengthen the reply leg under contention. Two more cores are
+    # cheap and help the burst case; they do NOT explain the enclave's 10x
+    # slowdown at idle, which is a separate, open question.
+    cpu       = 4
+    memory_mb = 2048
+  }
+
+  network {
+    # Shim-facing submissions. 8083, not 443, and the platform maps the domain
+    # onto it: see the http block below. 8083 is the platform's undocumented
+    # default (the in-enclave proxy forwards to 127.0.0.1:8083 regardless of what
+    # `http { port }` declares); declaring 8083 here AND below means this works
+    # against the current behaviour and keeps working once the declaration is
+    # honoured. The enclave cannot own 443 (Caution's parent Caddy holds it),
+    # which is why wallet-facing TLS is terminated in-enclave on 8083.
+    ingress {
+      cidr_ipv4   = "0.0.0.0/0"
+      port        = 8083
+      ip_protocol = "tcp"
+    }
+
+    # !! NOT ENFORCED BY THE PLATFORM (verified 2026-08-19). !!
+    #
+    # Caution parses this whole `egress` list, validates it against the schema,
+    # and then reduces it to ONE BOOLEAN: is the list empty or not. A non-empty
+    # list gets the enclave a NATted TAP bridge to the parent with an
+    # unconditional `iptables ... -j ACCEPT`, an AWS security group whose egress
+    # is `0.0.0.0/0` on all protocols and ports, and a DHCP-supplied resolver.
+    # Confirmed in the platform source: caution-config/src/lib.rs:322-327,
+    # api/src/deployment.rs:2055-2061, terraform/.../user-data.sh:69-95.
+    #
+    # So this enclave HAS unrestricted outbound and working DNS, and the rules
+    # below express intent only. They are kept because they are the correct
+    # intent and cost nothing if enforcement ever arrives -- but NOTHING may be
+    # built on top of them, and no document may describe containment as a
+    # network-level property. Ask Caution before relying on any of this.
+    #
+    # Egress to exactly the indexers the hub broadcasts through, each a /32 on
+    # its gRPC port, and NOTHING else.
+    #
+    # The INTENT is that the hub, which sees every migration in the clear,
+    # should be structurally incapable of shipping it anywhere except the
+    # indexers it broadcasts through. Today that is a promise about the code,
+    # which is exactly what the wording here used to claim it was not.
+    #
+    # Note what is absent: no port 53, even though the indexer is authenticated
+    # by NAME. That combination is the point. ZIH_INDEXERS stays a list of
+    # literal addresses, so the enclave dials IPs and never resolves DNS, while
+    # ZIH_INDEXER_TLS names what the certificate must say. A poisoned DNS answer
+    # has nothing to poison, and a hijacked address cannot present a valid
+    # certificate for the name. assemble-caution.sh generates one block per
+    # endpoint from --indexers and enforces literal IPv4.
+    #
+    # With --nym, the hub also runs its OWN mixnet client (to receive submissions
+    # over the mixnet), so the operator-allowlisted gateway/nym-api egress rules
+    # from --nym-egress are appended here too. Note the residual inbound port
+    # above: a fully mixnet-only hub would drop the ingress + http block entirely
+    # (it receives over its outbound gateway link, no inbound port), which is the
+    # M7 tightening; today the HTTP submit path stays for transitional clearnet
+    # shims, so this deploy keeps both.
+    egress {
+      cidr_ipv4   = "66.241.124.200/32"
+      port        = 443
+      ip_protocol = "tcp"
+    }
+
+    # THE PART THAT MAKES THIS DEPLOYABLE AT ALL.
+    #
+    # `e2e_encryption { mode = "tls" }` is Caution's in-enclave TLS termination.
+    # The platform runs a Caddy INSIDE the enclave: it obtains the certificate
+    # for `domain`, terminates the shim's TLS in there, and forwards to our
+    # process on `port`. The private key is generated and held inside the enclave
+    # and the operator never holds it, which is the property the attestation
+    # argument depends on.
+    #
+    # Unlike the shim, NO `upstream_protocol` is set: the hub's inbound server is
+    # plain HTTP/1.1 (a POST of raw transaction bytes), which is Caddy's default
+    # upstream protocol. The shim needed `h2c` only because it is an HTTP/2-only
+    # gRPC server; setting h2c here would break the hub's HTTP/1.1 endpoint.
+    http {
+      domain = "zeronym-hub-9.shieldedinfra.net"
+      port   = 8083
+
+      e2e_encryption {
+        # `mode = "tls"`, per the current schema (caution-config E2eMode is
+        # steve|tls). `enabled = true` maps to the DEPRECATED `mode = "steve"`,
+        # not TLS, so TLS must be named explicitly.
+        mode = "tls"
+      }
+    }
+  }
+
+  unit "default" {
+    # The runtime stage's ENTRYPOINT is this binary at the image root. Stated
+    # explicitly because a mismatched unit command is a silent boot failure with
+    # no console to explain it. Keep it agreeing with the Containerfile.
+    command = "/zero-indexer-hub"
+
+    env = {
+      # Bind all interfaces on the port the in-enclave Caddy forwards to. The
+      # default is 0.0.0.0:8090; inside the enclave it must be the 8083 the
+      # platform forwards to.
+      ZIH_LISTEN = "0.0.0.0:8083"
+
+      # The indexers to broadcast through, as a comma-separated list of literal
+      # IPv4 host:port. Every batch member goes to EVERY endpoint: a migration
+      # that only ever entered one mempool is one outage away from never being
+      # mined. The egress blocks above must name exactly these IPs and ports.
+      ZIH_INDEXERS = "66.241.124.200:443"
+
+      # The name each indexer's certificate must carry. WITHOUT THIS THE HOP IS
+      # PLAINTEXT and the enclave's parent host reads every batch in the clear
+      # moments before it is public, which would undo most of the reason this
+      # runs in an enclave at all.
+      ZIH_INDEXER_TLS = "na.zec.rocks"
+
+      # Whether the hub accepts submissions over clearnet HTTP at POST /. The
+      # binary defaults this to FALSE: the mixnet is the submit path, and an open
+      # unauthenticated POST / on a 0.0.0.0/0 ingress is attack surface with no
+      # legitimate user. Assemble emits it explicitly rather than relying on the
+      # default, so a deploy can never be unsure which way it went. Set to true
+      # ONLY for a transitional clearnet shim, a local demo, or a test -- and if
+      # so, know what it costs: the hub then sees which shim sent each migration
+      # and when, which is the linkage the mixnet exists to break.
+      ZIH_HTTP_SUBMIT = "true"
+
+      # Default is `info`. The hub deliberately logs only counts and dispositions,
+      # never a txid or a transaction body (REVIEW.md #157), because in an enclave
+      # the log reaches the parent host. Do not raise this to debug in a deployed
+      # enclave.
+      # RUST_LOG = "info"
+    }
+  }
+
+  debug {
+    # FALSE is the point of the exercise: debug mode disables attestation, and an
+    # unattested hub proves nothing that running it on a laptop would not, while
+    # being trusted with plaintext migrations. Never ship debug = true.
+    #
+    # If the enclave boots but never serves, flip this to true and redeploy to
+    # open the parent's SSH so the console can be read at
+    # /var/log/nitro_enclaves/enclave-console.log; the Caution CLI has no logs
+    # command. The SSH key(s) come from --ssh-key at assemble time, so the operator
+    # who deploys is the one who can read the console, not a key baked into the repo.
+    # With --debug the flip is one boolean and the key is already listed; without
+    # --debug this list renders empty and is moot (SSH is closed under attestation).
+    enabled  = false
+    ssh_keys = []
+  }
+}
